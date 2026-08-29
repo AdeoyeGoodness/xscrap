@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Union
 from urllib.parse import urlparse, parse_qs
-from twscrape import API, gather
+from twscrape import API
 from src.extractors.base import BaseExtractor, ExtractionResult
 
 logger = logging.getLogger(__name__)
@@ -36,9 +36,11 @@ class TwitterExtractor(BaseExtractor):
     # high ceiling; the conversation search in particular can be deep.
     REPLY_LIMIT = 1000
 
-    # Hard ceiling on a single reply lookup, so one dead session cannot hang
-    # the bot. Two sources run, so the whole fetch can take up to twice this.
-    REPLY_TIMEOUT_SECONDS = 60
+    # Time budget per source. It is a safety net, not the usual stop: a single
+    # account normally hits its rate limit and ends pagination well before
+    # this. Partial results are kept when it does fire. Two sources run
+    # sequentially, so the whole fetch can take up to twice this.
+    REPLY_TIMEOUT_SECONDS = 120
 
     # Match twitter.com / x.com / mobile.twitter.com profile or status URLs.
     # The lookahead lets the handle end on trailing punctuation ("…/sama!").
@@ -60,9 +62,13 @@ class TwitterExtractor(BaseExtractor):
     MENTION_PATTERN = re.compile(r'@([a-zA-Z0-9_]{1,15})')
 
     def __init__(self, api: Optional[API] = None):
-        # raise_when_no_account keeps a request from blocking forever when
-        # every account is locked out or the stored session is dead.
-        self.tw_api = api or API(raise_when_no_account=True)
+        # wait_timeout=0 makes a rate-limited or locked account end pagination
+        # immediately and gracefully (the generator just stops) instead of
+        # either raising - which used to discard everything collected so far -
+        # or blocking up to 15 minutes for the rate-limit window to reset.
+        # raise_when_no_account=False keeps a dead session from raising mid-
+        # stream; we detect expiry separately via the active-account count.
+        self.tw_api = api or API(raise_when_no_account=False, wait_timeout=0)
 
     @property
     def platform_name(self) -> str:
@@ -182,25 +188,35 @@ class TwitterExtractor(BaseExtractor):
         return ReplyFetch(usernames=usernames)
 
     async def _collect_usernames(self, label: str, status_id: str, source) -> List[str]:
-        """Drain one tweet async-generator into a list of usernames.
+        """Stream one tweet async-generator into a list of usernames.
 
-        Failures degrade to an empty list so one dead source never sinks the
-        whole fetch; the other source still contributes what it found.
+        Collected names are appended as they arrive, so if the source is cut
+        short - by the time budget, a rate limit, or any error - everything
+        gathered up to that point is kept. The previous version buffered the
+        whole page set and returned nothing on timeout, which on large threads
+        threw away hundreds of real commenters.
         """
         usernames: List[str] = []
-        try:
-            tweets = await asyncio.wait_for(
-                gather(source), timeout=self.REPLY_TIMEOUT_SECONDS
-            )
-            for tweet in tweets:
+
+        async def drain() -> None:
+            async for tweet in source:
                 user = getattr(tweet, "user", None)
                 username = getattr(user, "username", None)
                 if username:
                     usernames.append(username)
+
+        try:
+            await asyncio.wait_for(drain(), timeout=self.REPLY_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            logger.warning("%s for status %s timed out", label, status_id)
+            logger.warning(
+                "%s for status %s hit the %ds budget; keeping %d collected",
+                label, status_id, self.REPLY_TIMEOUT_SECONDS, len(usernames),
+            )
         except Exception as e:
-            logger.warning("%s for status %s failed: %s", label, status_id, e)
+            logger.warning(
+                "%s for status %s stopped early (%s); keeping %d collected",
+                label, status_id, e, len(usernames),
+            )
         return usernames
 
     async def extract_all(self, url_or_text: str) -> ExtractionResult:

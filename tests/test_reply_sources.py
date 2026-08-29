@@ -135,3 +135,34 @@ async def test_session_dying_mid_fetch_is_flagged():
 
     assert result.session_expired is True
     assert result.usernames == ["alice", "bob"]
+
+
+@pytest.mark.asyncio
+async def test_partial_results_survive_a_timeout(monkeypatch):
+    """A source cut off by the time budget must keep what it already collected.
+
+    This is the regression that made big threads collapse: the old code
+    buffered the whole page set and returned nothing when the fetch was cut
+    short, discarding hundreds of real commenters.
+    """
+    import asyncio as _asyncio
+    from src.extractors import twitter as tw
+
+    monkeypatch.setattr(tw.TwitterExtractor, "REPLY_TIMEOUT_SECONDS", 0.2)
+
+    class SlowApi(FakeApi):
+        async def search(self, q, limit=-1, kv=None):
+            self.search_queries.append(q)
+            for username in ["c1", "c2", "c3"]:
+                yield _Tweet(username)
+            # Then the generator stalls forever, as a rate-limited page would.
+            await _asyncio.sleep(10)
+            yield _Tweet("never")
+
+    ext = tw.TwitterExtractor(api=SlowApi(direct=["alice"], conversation=[]))
+    result = await ext.fetch_commenter_usernames("20")
+
+    # alice (direct) plus the three names streamed before the stall - not zero,
+    # and not "never".
+    assert result.usernames == ["alice", "c1", "c2", "c3"]
+    assert "never" not in result.usernames
