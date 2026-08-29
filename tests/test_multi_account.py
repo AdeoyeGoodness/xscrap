@@ -17,14 +17,17 @@ def sessions_file(tmp_path, monkeypatch):
 
 @pytest.fixture
 def captured_registrations(monkeypatch):
-    """Record register_cookie_account calls without touching a real pool."""
+    """Record pool registrations without touching a real pool.
+
+    Patches the core `_register_account`, capturing (auth_token, ct0).
+    """
     calls = []
 
-    async def fake_register(auth_token, ct0):
+    async def fake_register(name, auth_token, ct0):
         calls.append((auth_token, ct0))
-        return config.cookie_account_name(auth_token)
+        return name
 
-    monkeypatch.setattr(config, "register_cookie_account", fake_register)
+    monkeypatch.setattr(config, "_register_account", fake_register)
     return calls
 
 
@@ -79,13 +82,20 @@ def test_write_sessions_round_trips(sessions_file):
 
 
 @pytest.mark.asyncio
-async def test_add_cookie_session_registers_and_persists(sessions_file, captured_registrations):
+async def test_add_cookie_session_registers_under_handle_and_persists(sessions_file, captured_registrations):
     name = await config.add_cookie_session("alice", "tokA", "ct0A")
 
-    assert name == config.cookie_account_name("tokA")
+    # Named by handle now (so /login + /auth share one row), not the hash.
+    assert name == "alice"
     assert captured_registrations == [("tokA", "ct0A")]
     stored = config._read_sessions()
     assert stored == [{"username": "alice", "auth_token": "tokA", "ct0": "ct0A"}]
+
+
+def test_account_name_prefers_handle_falls_back_to_hash():
+    assert config.account_name_for("Alice", "tokA") == "alice"
+    assert config.account_name_for("@Bob", "tokB") == "bob"
+    assert config.account_name_for("", "tokC") == config.cookie_account_name("tokC")
 
 
 @pytest.mark.asyncio
@@ -145,3 +155,53 @@ async def test_restore_does_not_double_count_env_already_stored(sessions_file, c
 
     assert count == 1
     assert captured_registrations == [("tokA", "ct0A")]
+
+
+@pytest.mark.asyncio
+async def test_login_persists_cookies_for_restore(sessions_file, monkeypatch):
+    """A successful /login backs itself up as a restorable cookie session.
+
+    This is what lets a /login account survive a DB wipe and keep working even
+    after the password session dies.
+    """
+    from src.services.auth_service import TwitterAuthService
+
+    captured = []
+
+    async def fake_register(name, auth_token, ct0):
+        captured.append((name, auth_token, ct0))
+        return name
+
+    monkeypatch.setattr(config, "_register_account", fake_register)
+
+    class _Acct:
+        active = True
+        error_msg = None
+        cookies = {"auth_token": "loginTok", "ct0": "loginCt0", "guest_id": "x"}
+
+    class _Pool:
+        async def delete_accounts(self, names): pass
+        async def add_account(self, *a, **k): pass
+        async def get_account(self, name): return _Acct()
+        async def save(self, acc): pass
+
+    monkeypatch.setattr(
+        "src.services.auth_service.twscrape_login",
+        lambda account: _make_awaitable(None),
+    )
+
+    svc = TwitterAuthService(pool=_Pool(), api=object())
+    ok, msg = await svc.login_account("CyberSwag", "pw", "e@mail")
+
+    assert ok is True
+    # Cookies were persisted under the login handle for later restore.
+    assert ("cyberswag", "loginTok", "loginCt0") in captured
+    assert config._read_sessions() == [
+        {"username": "CyberSwag", "auth_token": "loginTok", "ct0": "loginCt0"}
+    ]
+
+
+def _make_awaitable(value):
+    async def _coro():
+        return value
+    return _coro()

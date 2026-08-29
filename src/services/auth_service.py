@@ -79,10 +79,28 @@ class TwitterAuthService:
             if not account.active:
                 return False, self._explain_failure(account.error_msg or "")
 
+            # Back the login up with its own cookies: persist auth_token/ct0 so
+            # the session survives a DB wipe and keeps working (cookie-backed)
+            # even if the password login later dies. Best-effort - a persistence
+            # failure must not fail an otherwise successful login.
+            await self._persist_login_cookies(handle, account)
+
             return True, f"Successfully logged into Twitter as @{handle}"
         except Exception as e:
             logger.error(f"Twitter login error for {handle}: {e}")
             return False, self._explain_failure(str(e))
+
+    async def _persist_login_cookies(self, handle: str, account) -> None:
+        """Store a freshly logged-in account's cookies as a restorable session."""
+        try:
+            cookies = getattr(account, "cookies", None) or {}
+            auth_token = cookies.get("auth_token", "")
+            ct0 = cookies.get("ct0", "")
+            if auth_token and ct0:
+                from src.config import add_cookie_session
+                await add_cookie_session(handle, auth_token, ct0)
+        except Exception as e:
+            logger.warning(f"Could not persist login cookies for {handle}: {e}")
 
     @staticmethod
     def _explain_failure(reason: str) -> str:

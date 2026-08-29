@@ -136,22 +136,30 @@ def update_twitter_auth_token(token: str, ct0: str = "") -> None:
     _write_env_var("TWITTER_CT0", TWITTER_CT0)
 
 
-async def register_cookie_account(auth_token: str, ct0: str) -> str:
-    """Register an auth_token/ct0 cookie pair as an active twscrape account.
+def account_name_for(username: str, auth_token: str) -> str:
+    """Pool row name for a session: the real handle when known, else the hash.
+
+    Naming by handle means /login and /auth land the same account on ONE row
+    (no duplicate), and /auth_status shows @handle without a lookup. The hash
+    name is the fallback for handle-less records (e.g. the migrated legacy env
+    pair).
+    """
+    handle = (username or "").strip().lstrip("@").lower()
+    return handle or cookie_account_name(auth_token)
+
+
+async def _register_account(name: str, auth_token: str, ct0: str) -> str:
+    """Register/refresh one cookie-backed row under an explicit name.
 
     Both cookies are required: X rejects GraphQL calls whose x-csrf-token (ct0)
     does not match the session, so a placeholder ct0 yields a silently dead
-    account that fails every request.
-
-    The row is named deterministically from the token so re-registering the same
-    token refreshes it in place while a new token adds another account. Returns
-    the pool row name. Persistence-free by contract: `add_cookie_session` layers
-    the sessions-file write on top, and the boot restore calls this directly.
+    account. Persistence-free by contract — callers layer the sessions file on
+    top. If the row already exists (e.g. a /login account under its handle) its
+    password is left intact; only the cookies and active flag are refreshed.
     """
     from twscrape import AccountsPool
 
     pool = AccountsPool()
-    name = cookie_account_name(auth_token)
     cookies = json.dumps({"auth_token": auth_token.strip(), "ct0": ct0.strip()})
 
     if not await pool.get_account(name):
@@ -163,14 +171,23 @@ async def register_cookie_account(auth_token: str, ct0: str) -> str:
     return name
 
 
-async def add_cookie_session(username: str, auth_token: str, ct0: str) -> str:
-    """Register a cookie session in the pool AND persist it (the /auth path).
+async def register_cookie_account(auth_token: str, ct0: str) -> str:
+    """Register an auth_token/ct0 pair under the deterministic hash name.
 
-    `username` is the resolved X handle, stored as metadata so /auth_status can
-    show real handles. The lock makes concurrent /auth commands safe.
+    Kept with this exact signature for the boot env-restore path and its tests.
+    """
+    return await _register_account(cookie_account_name(auth_token), auth_token, ct0)
+
+
+async def add_cookie_session(username: str, auth_token: str, ct0: str) -> str:
+    """Register a session in the pool under its handle AND persist it.
+
+    Used by both /auth (resolved handle) and a successful /login (login handle).
+    Naming by handle keeps a /login row and its cookie backup on ONE pool row.
+    The lock makes concurrent writers safe.
     """
     async with _sessions_lock:
-        name = await register_cookie_account(auth_token, ct0)
+        name = await _register_account(account_name_for(username, auth_token), auth_token, ct0)
         _upsert_session_record(username, auth_token, ct0)
         return name
 
@@ -197,7 +214,8 @@ async def restore_cookie_accounts() -> int:
     restored = 0
     for record in sessions:
         try:
-            await register_cookie_account(record["auth_token"], record["ct0"])
+            name = account_name_for(record.get("username", ""), record["auth_token"])
+            await _register_account(name, record["auth_token"], record["ct0"])
             restored += 1
         except Exception as e:
             logger.warning(
@@ -240,6 +258,16 @@ async def clear_all_cookie_sessions() -> None:
     the user just cleared.
     """
     global TWITTER_AUTH_TOKEN, TWITTER_CT0
+
+    # Names of every session we manage, computed before the file is cleared, so
+    # handle-named rows (from /auth and /login-backed sessions) are removed too.
+    async with _sessions_lock:
+        managed = {
+            account_name_for(s.get("username", ""), s["auth_token"])
+            for s in _read_sessions()
+        }
+        _clear_session_records()
+
     TWITTER_AUTH_TOKEN = ""
     TWITTER_CT0 = ""
     os.environ["TWITTER_AUTH_TOKEN"] = ""
@@ -247,21 +275,20 @@ async def clear_all_cookie_sessions() -> None:
     _write_env_var("TWITTER_AUTH_TOKEN", "")
     _write_env_var("TWITTER_CT0", "")
 
-    async with _sessions_lock:
-        _clear_session_records()
-
     try:
         from twscrape import AccountsPool
         pool = AccountsPool()
         accounts = await pool.get_all()
-        # Remove every cookie row (current hash-named and any legacy fixed name).
-        cookie_rows = [
+        # Remove every managed session row, plus any hash-named / legacy cookie
+        # rows left from earlier builds.
+        rows = [
             a.username for a in accounts
-            if a.username == COOKIE_ACCOUNT_NAME
+            if a.username in managed
+            or a.username == COOKIE_ACCOUNT_NAME
             or a.username.startswith(COOKIE_ACCOUNT_PREFIX)
         ]
-        if cookie_rows:
-            await pool.delete_accounts(cookie_rows)
+        if rows:
+            await pool.delete_accounts(rows)
         # Deactivate any remaining interactively logged-in accounts so the bot
         # really is unauthenticated afterwards. Rows are kept so /login revives.
         for account in await pool.get_all():

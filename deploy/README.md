@@ -123,6 +123,11 @@ account in its pool automatically, so adding more accounts pages deeper.
 - Use **throwaway accounts**. Heavy reply-scraping can get an account
   rate-limited hard or suspended; never use anything you care about.
 
+`/login` (interactive username/password) also accumulates and, on success, backs
+itself up with its own cookies — so a `/login` account is cookie-backed too and
+survives a DB wipe. Note `/login` uses X's password endpoint, which Cloudflare
+often blocks from datacenter IPs; on a VPS prefer `/auth`, or set `TWS_PROXY`.
+
 Sessions persist in `/opt/whale/.sessions.json` (owner-only, gitignored) and are
 restored on every boot, so they survive a restart or an `accounts.db` wipe. The
 legacy single `TWITTER_AUTH_TOKEN`/`TWITTER_CT0` env pair still works and is
