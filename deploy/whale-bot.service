@@ -1,0 +1,41 @@
+[Unit]
+Description=WHALE Lead Enrichment Telegram Bot
+Documentation=https://github.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whale
+Group=whale
+WorkingDirectory=/opt/whale
+
+# config.py loads /opt/whale/.env itself via python-dotenv, so systemd does not
+# need EnvironmentFile - which would choke on values containing # or quotes.
+ExecStart=/opt/whale/.venv/bin/python -m src.bot
+
+# Telegram allows exactly one getUpdates consumer per token. systemd keeps a
+# single instance; never start a second copy by hand while this unit is active.
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whale-bot
+
+# Hardening. accounts.db is written in WorkingDirectory, so that path - and
+# only that path - stays writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/whale
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

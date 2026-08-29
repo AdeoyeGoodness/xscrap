@@ -1,0 +1,17 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+env/
+
+# Twitter / X session store - contains live auth cookies
+accounts.db
+accounts.db-journal
+
+# Local virtualenvs
+.venv/
