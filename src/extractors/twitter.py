@@ -32,10 +32,12 @@ class TwitterExtractor(BaseExtractor):
         "download", "help", "rules", "share", "status"
     }
 
-    # Maximum replies pulled per post link.
-    REPLY_LIMIT = 200
+    # Maximum tweets pulled per source, per post link. Large threads need a
+    # high ceiling; the conversation search in particular can be deep.
+    REPLY_LIMIT = 1000
 
-    # Hard ceiling on a reply lookup, so one dead session cannot hang the bot.
+    # Hard ceiling on a single reply lookup, so one dead session cannot hang
+    # the bot. Two sources run, so the whole fetch can take up to twice this.
     REPLY_TIMEOUT_SECONDS = 60
 
     # Match twitter.com / x.com / mobile.twitter.com profile or status URLs.
@@ -138,21 +140,36 @@ class TwitterExtractor(BaseExtractor):
             logger.info("Skipping reply fetch for %s: no active account", status_id)
             return ReplyFetch(usernames=[])
 
+        twid = int(status_id)
+
+        # Two complementary sources. tweet_replies (the TweetDetail view)
+        # returns only direct replies to the post and drops nested ones; the
+        # conversation search catches replies-to-replies and usually reaches
+        # deeper into a large thread. Their union is far closer to the real
+        # commenter set than either alone.
+        direct = await self._collect_usernames(
+            "direct replies",
+            status_id,
+            self.tw_api.tweet_replies(twid, limit=self.REPLY_LIMIT),
+        )
+        conversation = await self._collect_usernames(
+            "conversation search",
+            status_id,
+            self.tw_api.search(f"conversation_id:{twid}", limit=self.REPLY_LIMIT),
+        )
+
+        seen: set = set()
         usernames: List[str] = []
-        try:
-            replies = await asyncio.wait_for(
-                gather(self.tw_api.tweet_replies(int(status_id), limit=self.REPLY_LIMIT)),
-                timeout=self.REPLY_TIMEOUT_SECONDS,
-            )
-            for tweet in replies:
-                user = getattr(tweet, "user", None)
-                username = getattr(user, "username", None)
-                if username:
-                    usernames.append(username)
-        except asyncio.TimeoutError:
-            logger.warning(f"Reply fetch for status {status_id} timed out")
-        except Exception as e:
-            logger.warning(f"Reply fetch failed for status {status_id}: {e}")
+        for name in [*direct, *conversation]:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                usernames.append(name)
+
+        logger.info(
+            "Status %s: %d direct + %d via search -> %d unique commenter(s)",
+            status_id, len(direct), len(conversation), len(usernames),
+        )
 
         # twscrape deactivates an account itself when X answers "(32) Could not
         # authenticate you", a bare 403, or "(326) Denied by access control".
@@ -163,6 +180,28 @@ class TwitterExtractor(BaseExtractor):
             return ReplyFetch(usernames=usernames, session_expired=True)
 
         return ReplyFetch(usernames=usernames)
+
+    async def _collect_usernames(self, label: str, status_id: str, source) -> List[str]:
+        """Drain one tweet async-generator into a list of usernames.
+
+        Failures degrade to an empty list so one dead source never sinks the
+        whole fetch; the other source still contributes what it found.
+        """
+        usernames: List[str] = []
+        try:
+            tweets = await asyncio.wait_for(
+                gather(source), timeout=self.REPLY_TIMEOUT_SECONDS
+            )
+            for tweet in tweets:
+                user = getattr(tweet, "user", None)
+                username = getattr(user, "username", None)
+                if username:
+                    usernames.append(username)
+        except asyncio.TimeoutError:
+            logger.warning("%s for status %s timed out", label, status_id)
+        except Exception as e:
+            logger.warning("%s for status %s failed: %s", label, status_id, e)
+        return usernames
 
     async def extract_all(self, url_or_text: str) -> ExtractionResult:
         """Extract every Twitter username referenced by the given text.
