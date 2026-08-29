@@ -21,10 +21,11 @@ from telegram.ext import (
 )
 from src.config import (
     TELEGRAM_BOT_TOKEN,
-    update_twitter_auth_token,
-    register_cookie_account,
-    restore_cookie_account_from_env,
-    clear_twitter_auth_token,
+    cookie_account_name,
+    add_cookie_session,
+    restore_cookie_accounts,
+    clear_all_cookie_sessions,
+    _read_sessions,
 )
 from src.health import start_health_server
 from src.services.enrichment import EnrichmentService
@@ -98,7 +99,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>How to extract usernames &amp; commenters:</b>\n"
         "1. <b>Account Login:</b> Send <code>/login</code> to log in with your Twitter account.\n"
         "2. <b>Cookie Auth:</b> Send <code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code> — both cookies "
-        "are required; X rejects a session whose ct0 does not match.\n"
+        "are required; X rejects a session whose ct0 does not match. Run it once per "
+        "account to add several — the bot rotates them to page deeper into big threads.\n"
         "3. <b>Post Extraction:</b> Send any post link: "
         "<code>https://x.com/username/status/12345</code>. While authenticated the bot returns the "
         "author plus every commenter's username.\n"
@@ -210,9 +212,27 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception:
         pass
 
-    update_twitter_auth_token(auth_token, ct0)
+    if not auth_token or not ct0:
+        await chat.send_message(
+            "❌ <b>Both cookies are required:</b> <code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code>.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Resolve the real handle. A None here means the cookies are invalid or
+    # expired, so we reject rather than store a silently-dead account.
+    username = await auth_service.resolve_screen_name(auth_token, ct0)
+    if not username:
+        await chat.send_message(
+            "❌ <b>Those cookies are invalid or expired.</b>\n"
+            "Copy a fresh <code>auth_token</code> and <code>ct0</code> from a logged-in "
+            "browser session and try again.",
+            parse_mode="HTML"
+        )
+        return
+
     try:
-        await register_cookie_account(auth_token, ct0)
+        await add_cookie_session(username, auth_token, ct0)
     except Exception as e:
         logger.error(f"Could not register cookie account: {e}")
         await chat.send_message(
@@ -220,49 +240,82 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    total, active = await auth_service.get_pool_counts()
     await chat.send_message(
-        "✅ <b>Twitter session saved!</b>\n\n"
-        "Send a post link and the bot will return the author plus every commenter's username.",
+        f"✅ <b>Added <code>@{username}</code>.</b>\n"
+        f"Pool: <b>{total}</b> account(s), <b>{active}</b> active.\n\n"
+        "Add more with <code>/auth</code> to page deeper into large threads.",
         parse_mode="HTML"
     )
 
 
-async def auth_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check active Twitter authentication status."""
-    checking = await update.message.reply_text(
-        "⏳ <i>Checking session...</i>", parse_mode="HTML"
-    )
-    account_count = await auth_service.get_active_accounts_count()
-    verified = await auth_service.verify_session()
+def _handle_for_row(name: str, name_to_handle: dict) -> str:
+    """Display label for a pool row: the real @handle when known, else the id."""
+    handle = name_to_handle.get(name)
+    if handle:
+        return f"@{handle}"
+    # Interactive (/login) rows are stored under the real handle already.
+    if not name.startswith("cookie_"):
+        return f"@{name}"
+    return f"<code>{name}</code>"
 
-    if account_count > 0 and not verified:
+
+def _render_account_line(row: dict, name_to_handle: dict) -> str:
+    """One /auth_status line: label plus active / throttled / expired state."""
+    label = _handle_for_row(row["name"], name_to_handle)
+    if not row["active"]:
+        reason = row.get("error_msg")
+        suffix = f" (<i>{reason[:60]}</i>)" if reason else ""
+        return f"❌ {label} — expired{suffix}"
+    locked_until = row.get("locked_until")
+    if locked_until is not None:
+        return f"🔒 {label} — throttled until {locked_until:%H:%M} UTC"
+    return f"✅ {label} — active"
+
+
+async def auth_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check Twitter authentication status, per account."""
+    checking = await update.message.reply_text(
+        "⏳ <i>Checking sessions...</i>", parse_mode="HTML"
+    )
+
+    health = await auth_service.account_health()
+    total, active = len(health), sum(1 for h in health if h["active"])
+
+    if total == 0:
         await checking.edit_text(
-            "🔒 <b>Twitter Authentication Status:</b> <code>SESSION EXPIRED</code>\n"
-            "The stored login no longer works. Re-authenticate with "
-            "<code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code>.",
+            "🔒 <b>Twitter Authentication Status:</b> <code>NOT AUTHENTICATED</code>\n\n"
+            "Use <code>/login</code>, or send <code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code>.",
             parse_mode="HTML"
         )
         return
 
-    if verified:
-        reply = (
-            "🔑 <b>Twitter Authentication Status:</b> <code>CONNECTED</code>\n"
-            f"Active accounts: <b>{account_count}</b>\n\n"
-            "Post links will return the author plus every commenter's username."
-        )
+    # Map hash-named cookie rows back to the real handle stored at /auth time.
+    name_to_handle = {
+        cookie_account_name(s["auth_token"]): s["username"]
+        for s in _read_sessions() if s.get("username")
+    }
+
+    # One probe decides the headline; per-account lines carry the detail.
+    verified = await auth_service.verify_session()
+    if active > 0 and not verified:
+        headline = "🔒 <b>Twitter Authentication Status:</b> <code>SESSION EXPIRED</code>"
     else:
-        reply = (
-            "🔒 <b>Twitter Authentication Status:</b> <code>NOT AUTHENTICATED</code>\n\n"
-            "Use <code>/login</code>, or send <code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code>."
-        )
-    await checking.edit_text(reply, parse_mode="HTML")
+        headline = "🔑 <b>Twitter Authentication Status:</b> <code>CONNECTED</code>"
+
+    lines = [
+        headline,
+        f"<b>{total}</b> account(s), <b>{active}</b> active:\n",
+    ]
+    lines += [_render_account_line(row, name_to_handle) for row in health]
+    await checking.edit_text("\n".join(lines), parse_mode="HTML")
 
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /logout command."""
-    await clear_twitter_auth_token()
+    """Handle /logout command: clear every stored session."""
+    await clear_all_cookie_sessions()
     await update.message.reply_text(
-        "🚪 <b>Twitter session cleared.</b> The bot is now in unauthenticated mode.",
+        "🚪 <b>All Twitter sessions cleared.</b> The bot is now in unauthenticated mode.",
         parse_mode="HTML"
     )
 
@@ -333,9 +386,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def restore_session(application) -> None:
-    """Rebuild the X session from the environment before polling starts."""
-    if await restore_cookie_account_from_env():
-        logger.info("Twitter session restored; commenter extraction is available")
+    """Rebuild every stored X session before polling starts."""
+    count = await restore_cookie_accounts()
+    if count:
+        logger.info(
+            "%d Twitter session(s) restored; commenter extraction is available", count
+        )
 
 
 def main() -> None:

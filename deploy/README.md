@@ -107,6 +107,29 @@ Then message the bot on Telegram and send `/auth_status`.
 
 ---
 
+## Adding X accounts (deeper coverage on big threads)
+
+A single X account can only page a few hundred tweets per 15-minute rate window,
+so very large *fresh* threads come back partial. The bot rotates through every
+account in its pool automatically, so adding more accounts pages deeper.
+
+- Send `/auth <auth_token> <ct0>` **once per account.** Each distinct account is
+  added to the pool; re-sending the same account just refreshes its cookies.
+- The bot resolves and shows each account's real `@handle`, and rejects invalid
+  or expired cookies on the spot.
+- `/auth_status` lists every account with its state — `✅ active`,
+  `🔒 throttled until HH:MM`, or `❌ expired` — so you can see which throwaway
+  got rate-limited.
+- Use **throwaway accounts**. Heavy reply-scraping can get an account
+  rate-limited hard or suspended; never use anything you care about.
+
+Sessions persist in `/opt/whale/.sessions.json` (owner-only, gitignored) and are
+restored on every boot, so they survive a restart or an `accounts.db` wipe. The
+legacy single `TWITTER_AUTH_TOKEN`/`TWITTER_CT0` env pair still works and is
+migrated into the store on first boot.
+
+---
+
 ## Updating
 
 ```bash

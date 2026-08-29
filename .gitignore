@@ -13,5 +13,8 @@ env/
 accounts.db
 accounts.db-journal
 
+# Multi-account cookie store - live auth cookies
+.sessions.json
+
 # Local virtualenvs
 .venv/

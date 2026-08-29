@@ -1,10 +1,23 @@
 import asyncio
 import logging
-from typing import Tuple
+from datetime import datetime, timezone
+from typing import Tuple, List, Dict, Optional, Any
+
+import httpx
 from twscrape import API, AccountsPool
+from twscrape.account import TOKEN as X_BEARER_TOKEN
 from twscrape.login import login as twscrape_login
 
 logger = logging.getLogger(__name__)
+
+# Endpoint that returns the authenticated user's own profile. Used to resolve a
+# cookie session's real handle and to validate the cookies at add-time.
+VERIFY_CREDENTIALS_URL = "https://api.twitter.com/1.1/account/verify_credentials.json"
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 # Password login is the endpoint X protects most aggressively. These markers
 # mean the request never reached the login flow, so no credential change helps.
@@ -100,6 +113,31 @@ class TwitterAuthService:
 
         return reason.strip() or "Login did not complete and X gave no reason."
 
+    async def resolve_screen_name(self, auth_token: str, ct0: str) -> Optional[str]:
+        """Return the X handle these cookies belong to, or None if they fail.
+
+        Doubles as add-time validation: invalid or expired cookies return None,
+        so /auth can reject them instead of storing a silently-dead account.
+        """
+        auth_token, ct0 = auth_token.strip(), ct0.strip()
+        headers = {
+            "authorization": X_BEARER_TOKEN,
+            "x-csrf-token": ct0,
+            "cookie": f"auth_token={auth_token}; ct0={ct0}",
+            "user-agent": _BROWSER_UA,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.PROBE_TIMEOUT_SECONDS) as client:
+                resp = await client.get(VERIFY_CREDENTIALS_URL, headers=headers)
+            if resp.status_code != 200:
+                logger.info("verify_credentials returned %s", resp.status_code)
+                return None
+            screen_name = resp.json().get("screen_name")
+            return screen_name.strip() if screen_name else None
+        except Exception as e:
+            logger.warning(f"Could not resolve screen name: {e}")
+            return None
+
     async def get_active_accounts_count(self) -> int:
         """Return the number of logged-in, usable accounts in the pool."""
         try:
@@ -108,6 +146,65 @@ class TwitterAuthService:
         except Exception as e:
             logger.warning(f"Could not read twscrape pool stats: {e}")
             return 0
+
+    async def get_pool_counts(self) -> Tuple[int, int]:
+        """Return (total, active) account rows.
+
+        Derived from get_all() rather than stats() so it does not depend on
+        twscrape's stat key names across versions.
+        """
+        try:
+            accounts = await self.pool.get_all()
+            return len(accounts), sum(1 for a in accounts if a.active)
+        except Exception as e:
+            logger.warning(f"Could not read twscrape pool: {e}")
+            return 0, 0
+
+    async def account_health(self) -> List[Dict[str, Any]]:
+        """Per-account health for /auth_status.
+
+        Returns {name, active, locked_until, error_msg}. locked_until is the
+        furthest future lock across all queues (i.e. throttled until then), or
+        None when the account is free.
+        """
+        try:
+            accounts = await self.pool.get_all()
+        except Exception as e:
+            logger.warning(f"Could not read twscrape pool: {e}")
+            return []
+
+        now = datetime.now(timezone.utc)
+        health: List[Dict[str, Any]] = []
+        for account in accounts:
+            locked_until = self._max_future_lock(getattr(account, "locks", None), now)
+            health.append({
+                "name": account.username,
+                "active": bool(account.active),
+                "locked_until": locked_until,
+                "error_msg": getattr(account, "error_msg", None),
+            })
+        return health
+
+    @staticmethod
+    def _max_future_lock(locks: Optional[Dict[str, Any]], now: datetime) -> Optional[datetime]:
+        """Furthest future lock timestamp across queues, or None if all past."""
+        if not isinstance(locks, dict):
+            return None
+        latest: Optional[datetime] = None
+        for value in locks.values():
+            parsed = value
+            if isinstance(value, str):
+                try:
+                    parsed = datetime.fromisoformat(value)
+                except ValueError:
+                    continue
+            if not isinstance(parsed, datetime):
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed > now and (latest is None or parsed > latest):
+                latest = parsed
+        return latest
 
     async def is_authenticated(self) -> bool:
         """True when at least one account is flagged usable in the pool."""
