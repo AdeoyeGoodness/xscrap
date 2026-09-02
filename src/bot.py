@@ -19,17 +19,20 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
+from dataclasses import dataclass
+
+from twscrape import API, AccountsPool
+
 from src.config import (
     TELEGRAM_BOT_TOKEN,
-    cookie_account_name,
-    add_cookie_session,
-    restore_cookie_accounts,
-    clear_all_cookie_sessions,
-    _read_sessions,
+    account_name_for,
+    store_for_user,
+    SessionStore,
 )
 from src.health import start_health_server
 from src.services.enrichment import EnrichmentService
 from src.services.auth_service import TwitterAuthService
+from src.extractors.twitter import TwitterExtractor
 
 # Configure logging
 logging.basicConfig(
@@ -41,9 +44,44 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Initialize Services
-enrichment_service = EnrichmentService()
-auth_service = TwitterAuthService()
+
+@dataclass
+class UserContext:
+    """One Telegram user's isolated services, bound to their private pool."""
+    store: SessionStore
+    enrichment: EnrichmentService
+    auth: TwitterAuthService
+    restored: bool = False
+
+
+# One context per Telegram user id. Built lazily on first interaction; each is
+# wired to that user's own DB file, so no user can see or use another's accounts.
+_user_contexts: dict = {}
+
+
+async def get_user_context(user_id: int) -> UserContext:
+    """Return the caller's isolated context, building and restoring it once."""
+    ctx = _user_contexts.get(user_id)
+    if ctx is None:
+        store = store_for_user(user_id)
+        pool = AccountsPool(str(store.db_path))
+        # wait_timeout=0: a rate-limited account ends pagination immediately and
+        # gracefully instead of raising (discard) or blocking for the reset.
+        api = API(pool, raise_when_no_account=False, wait_timeout=0)
+        ctx = UserContext(
+            store=store,
+            enrichment=EnrichmentService(extractors=[TwitterExtractor(api=api)]),
+            auth=TwitterAuthService(pool=pool, store=store),
+        )
+        _user_contexts[user_id] = ctx
+    if not ctx.restored:
+        # Rebuild the pool from the cookie backup once, so a wiped DB self-heals.
+        try:
+            await ctx.store.restore()
+        except Exception as e:
+            logger.warning("Restore failed for user %s: %s", user_id, e)
+        ctx.restored = True
+    return ctx
 
 # Conversation states for /login
 USERNAME, PASSWORD, EMAIL = range(3)
@@ -105,7 +143,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<code>https://x.com/username/status/12345</code>. While authenticated the bot returns the "
         "author plus every commenter's username.\n"
         "4. <b>Comment Text Parsing:</b> Copy-paste or forward comments directly into this chat.\n\n"
-        "The reply is a plain numbered list of usernames — tap one to copy it."
+        "The reply is a plain numbered list of usernames — tap one to copy it.\n\n"
+        "🔒 <b>Your accounts are private</b> — only you can see or use the X accounts "
+        "you add; no other user of this bot has access to them."
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
@@ -160,7 +200,8 @@ async def login_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "⏳ <i>Authenticating with Twitter... Please wait...</i>", parse_mode="HTML"
     )
 
-    success, msg = await auth_service.login_account(username, password, email)
+    ctx = await get_user_context(update.effective_user.id)
+    success, msg = await ctx.auth.login_account(username, password, email)
 
     if success:
         # The pool now holds a live session. Do NOT write a placeholder token
@@ -219,20 +260,22 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # Resolve the real handle. A None here means the cookies are invalid or
-    # expired, so we reject rather than store a silently-dead account.
-    username = await auth_service.resolve_screen_name(auth_token, ct0)
-    if not username:
+    ctx = await get_user_context(update.effective_user.id)
+
+    # Classify the cookies: a real 401 is genuinely bad; a 403/429/network failure
+    # (e.g. the datacenter-IP block) is only "unverified" - the cookies may work.
+    outcome, username = await ctx.auth.resolve_credentials(auth_token, ct0)
+    if outcome == "invalid":
         await chat.send_message(
             "❌ <b>Those cookies are invalid or expired.</b>\n"
             "Copy a fresh <code>auth_token</code> and <code>ct0</code> from a logged-in "
-            "browser session and try again.",
+            "browser session (same tab, don't log out after) and try again.",
             parse_mode="HTML"
         )
         return
 
     try:
-        await add_cookie_session(username, auth_token, ct0)
+        await ctx.store.add_cookie_session(username or "", auth_token, ct0)
     except Exception as e:
         logger.error(f"Could not register cookie account: {e}")
         await chat.send_message(
@@ -240,13 +283,23 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    total, active = await auth_service.get_pool_counts()
-    await chat.send_message(
-        f"✅ <b>Added <code>@{username}</code>.</b>\n"
-        f"Pool: <b>{total}</b> account(s), <b>{active}</b> active.\n\n"
-        "Add more with <code>/auth</code> to page deeper into large threads.",
-        parse_mode="HTML"
-    )
+    total, active = await ctx.auth.get_pool_counts()
+    if outcome == "ok":
+        await chat.send_message(
+            f"✅ <b>Added <code>@{username}</code>.</b>\n"
+            f"Your pool: <b>{total}</b> account(s), <b>{active}</b> active.\n\n"
+            "Add more with <code>/auth</code> to page deeper into large threads.",
+            parse_mode="HTML"
+        )
+    else:  # unverified
+        await chat.send_message(
+            "⚠️ <b>Added, but couldn't verify from this server.</b>\n"
+            "X didn't confirm the cookies — likely the datacenter-IP block, or the "
+            "cookies may be bad. Send a post link and check <code>/auth_status</code>: "
+            "if it works you'll see the account go active.\n\n"
+            f"Your pool: <b>{total}</b> account(s), <b>{active}</b> active.",
+            parse_mode="HTML"
+        )
 
 
 def _handle_for_row(name: str, name_to_handle: dict) -> str:
@@ -279,7 +332,8 @@ async def auth_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "⏳ <i>Checking sessions...</i>", parse_mode="HTML"
     )
 
-    health = await auth_service.account_health()
+    ctx = await get_user_context(update.effective_user.id)
+    health = await ctx.auth.account_health()
     total, active = len(health), sum(1 for h in health if h["active"])
 
     if total == 0:
@@ -292,12 +346,12 @@ async def auth_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Map hash-named cookie rows back to the real handle stored at /auth time.
     name_to_handle = {
-        cookie_account_name(s["auth_token"]): s["username"]
-        for s in _read_sessions() if s.get("username")
+        account_name_for(s["username"], s["auth_token"]): s["username"]
+        for s in ctx.store.read_sessions() if s.get("username")
     }
 
     # One probe decides the headline; per-account lines carry the detail.
-    verified = await auth_service.verify_session()
+    verified = await ctx.auth.verify_session()
     if active > 0 and not verified:
         headline = "🔒 <b>Twitter Authentication Status:</b> <code>SESSION EXPIRED</code>"
     else:
@@ -312,10 +366,11 @@ async def auth_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /logout command: clear every stored session."""
-    await clear_all_cookie_sessions()
+    """Handle /logout command: clear this user's stored sessions."""
+    ctx = await get_user_context(update.effective_user.id)
+    await ctx.store.clear_all()
     await update.message.reply_text(
-        "🚪 <b>All Twitter sessions cleared.</b> The bot is now in unauthenticated mode.",
+        "🚪 <b>Your Twitter sessions were cleared.</b> You're now in unauthenticated mode.",
         parse_mode="HTML"
     )
 
@@ -325,8 +380,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
 
+    ctx = await get_user_context(update.effective_user.id)
     text = update.message.text
-    result = await enrichment_service.extract(text)
+    result = await ctx.enrichment.extract(text)
 
     if not result.leads:
         await update.message.reply_text(
@@ -353,7 +409,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code> and send the link again.",
             parse_mode="HTML"
         )
-    elif "status/" in text.lower() and not await auth_service.is_authenticated():
+    elif "status/" in text.lower() and not await ctx.auth.is_authenticated():
         await update.message.reply_text(
             "💡 <b>Commenters were not included.</b>\n"
             "Log in with <code>/login</code> or <code>/auth &lt;auth_token&gt; &lt;ct0&gt;</code> "
@@ -385,15 +441,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-async def restore_session(application) -> None:
-    """Rebuild every stored X session before polling starts."""
-    count = await restore_cookie_accounts()
-    if count:
-        logger.info(
-            "%d Twitter session(s) restored; commenter extraction is available", count
-        )
-
-
 def main() -> None:
     """Start the Telegram bot."""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "your_telegram_bot_token_here":
@@ -409,12 +456,9 @@ def main() -> None:
     # require this to deploy at all, and the endpoint is what wakes the bot.
     start_health_server()
 
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(restore_session)
-        .build()
-    )
+    # No global session restore: each user's pool is restored lazily from their
+    # own cookie backup on their first interaction (get_user_context).
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Login Conversation Handler
     login_conv = ConversationHandler(

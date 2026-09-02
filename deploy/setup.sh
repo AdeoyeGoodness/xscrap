@@ -39,6 +39,7 @@ if [[ "$SRC_DIR" != "$APP_DIR" ]]; then
         --exclude '.pytest_cache' \
         --exclude 'accounts.db' \
         --exclude '.sessions.json' \
+        --exclude 'data' \
         --exclude '.env' \
         "$SRC_DIR/" "$APP_DIR/"
 fi
@@ -64,6 +65,8 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 # .sessions.json holds live cookie sessions; owner-only when present.
 [[ -f "$APP_DIR/.sessions.json" ]] && chmod 600 "$APP_DIR/.sessions.json"
+# data/ holds every user's private pool + cookie backup; owner-only.
+[[ -d "$APP_DIR/data" ]] && chmod 700 "$APP_DIR/data"
 chmod 750 "$APP_DIR"
 
 echo "==> Installing systemd unit"

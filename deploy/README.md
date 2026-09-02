@@ -107,16 +107,32 @@ Then message the bot on Telegram and send `/auth_status`.
 
 ---
 
+## Multi-user isolation
+
+The bot is **multi-user and isolated**: every Telegram user has their own private
+X account pool (`data/<uid>.db` + `data/<uid>.sessions.json`). A user only ever
+sees, uses, and clears their **own** accounts — `/auth_status` and `/logout` never
+touch anyone else's, and a fetch only rotates the sender's accounts. Access is
+open (anyone who finds the bot can use it), but no one can see another's accounts.
+
+> **After upgrading to the isolated model, existing accounts must be re-added
+> once** (clean slate — the old shared pool is retired). Send `/auth` again for
+> each account.
+
+---
+
 ## Adding X accounts (deeper coverage on big threads)
 
 A single X account can only page a few hundred tweets per 15-minute rate window,
 so very large *fresh* threads come back partial. The bot rotates through every
-account in its pool automatically, so adding more accounts pages deeper.
+account in **your** pool automatically, so adding more accounts pages deeper.
 
 - Send `/auth <auth_token> <ct0>` **once per account.** Each distinct account is
   added to the pool; re-sending the same account just refreshes its cookies.
-- The bot resolves and shows each account's real `@handle`, and rejects invalid
-  or expired cookies on the spot.
+- The bot resolves and shows each account's real `@handle`. A genuine `401`
+  (bad/expired cookies) is rejected; if the check itself is blocked from the
+  server (a `403`/`429`, e.g. the datacenter-IP block) the account is added
+  **unverified** — send a post link and watch `/auth_status` to see if it works.
 - `/auth_status` lists every account with its state — `✅ active`,
   `🔒 throttled until HH:MM`, or `❌ expired` — so you can see which throwaway
   got rate-limited.

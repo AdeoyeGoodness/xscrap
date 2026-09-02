@@ -13,8 +13,11 @@ env/
 accounts.db
 accounts.db-journal
 
-# Multi-account cookie store - live auth cookies
+# Multi-account cookie store - live auth cookies (legacy single-tenant)
 .sessions.json
+
+# Per-user data: <uid>.db pools and <uid>.sessions.json cookie backups
+data/
 
 # Local virtualenvs
 .venv/

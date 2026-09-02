@@ -1,4 +1,4 @@
-"""Tests for resolve_screen_name, pool counts, and per-account health."""
+"""Tests for resolve_credentials, pool counts, and per-account health."""
 
 from datetime import datetime, timedelta, timezone
 
@@ -17,7 +17,7 @@ class _Resp:
 
 
 class _FakeAsyncClient:
-    """Minimal stand-in for httpx.AsyncClient used by resolve_screen_name."""
+    """Minimal stand-in for httpx.AsyncClient used by resolve_credentials."""
     _resp = None
     _raise = None
 
@@ -48,31 +48,47 @@ def patch_httpx(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_returns_handle_on_200(patch_httpx):
+async def test_resolve_ok_on_200_with_handle(patch_httpx):
     patch_httpx(resp=_Resp(200, {"screen_name": "levelsio"}))
     svc = TwitterAuthService(pool=object())
-    assert await svc.resolve_screen_name("tok", "ct0") == "levelsio"
+    assert await svc.resolve_credentials("tok", "ct0") == ("ok", "levelsio")
 
 
 @pytest.mark.asyncio
-async def test_resolve_returns_none_on_non_200(patch_httpx):
+async def test_resolve_invalid_on_401(patch_httpx):
+    """A genuine 401 means the cookies are bad - reject."""
     patch_httpx(resp=_Resp(401, {}))
     svc = TwitterAuthService(pool=object())
-    assert await svc.resolve_screen_name("tok", "ct0") is None
+    assert await svc.resolve_credentials("tok", "ct0") == ("invalid", None)
 
 
 @pytest.mark.asyncio
-async def test_resolve_returns_none_on_network_error(patch_httpx):
+async def test_resolve_unverified_on_403_ip_block(patch_httpx):
+    """A 403 (datacenter/Cloudflare block) must NOT be reported as bad cookies."""
+    patch_httpx(resp=_Resp(403, {}))
+    svc = TwitterAuthService(pool=object())
+    assert await svc.resolve_credentials("tok", "ct0") == ("unverified", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_unverified_on_429_rate_limit(patch_httpx):
+    patch_httpx(resp=_Resp(429, {}))
+    svc = TwitterAuthService(pool=object())
+    assert await svc.resolve_credentials("tok", "ct0") == ("unverified", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_unverified_on_network_error(patch_httpx):
     patch_httpx(raise_exc=OSError("connection reset"))
     svc = TwitterAuthService(pool=object())
-    assert await svc.resolve_screen_name("tok", "ct0") is None
+    assert await svc.resolve_credentials("tok", "ct0") == ("unverified", None)
 
 
 @pytest.mark.asyncio
-async def test_resolve_returns_none_when_payload_lacks_handle(patch_httpx):
+async def test_resolve_unverified_when_200_lacks_handle(patch_httpx):
     patch_httpx(resp=_Resp(200, {"id": 123}))
     svc = TwitterAuthService(pool=object())
-    assert await svc.resolve_screen_name("tok", "ct0") is None
+    assert await svc.resolve_credentials("tok", "ct0") == ("unverified", None)
 
 
 class _Acct:

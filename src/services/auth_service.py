@@ -30,7 +30,7 @@ BLOCK_MARKERS = (
 
 
 class TwitterAuthService:
-    """Manages Twitter / X login sessions stored in the shared twscrape pool."""
+    """Manages one Telegram user's Twitter / X login sessions in their pool."""
 
     # A session check must not hang the /auth_status reply.
     PROBE_TIMEOUT_SECONDS = 20
@@ -38,8 +38,9 @@ class TwitterAuthService:
     # Any well-known handle works; only the auth outcome is of interest.
     PROBE_HANDLE = "jack"
 
-    def __init__(self, pool: AccountsPool = None, api: API = None):
+    def __init__(self, pool: AccountsPool = None, store=None, api: API = None):
         self.pool = pool or AccountsPool()
+        self.store = store  # SessionStore for this user; used to back up /login
         self.api = api or API(self.pool, raise_when_no_account=True)
 
     async def login_account(
@@ -92,13 +93,14 @@ class TwitterAuthService:
 
     async def _persist_login_cookies(self, handle: str, account) -> None:
         """Store a freshly logged-in account's cookies as a restorable session."""
+        if self.store is None:
+            return
         try:
             cookies = getattr(account, "cookies", None) or {}
             auth_token = cookies.get("auth_token", "")
             ct0 = cookies.get("ct0", "")
             if auth_token and ct0:
-                from src.config import add_cookie_session
-                await add_cookie_session(handle, auth_token, ct0)
+                await self.store.add_cookie_session(handle, auth_token, ct0)
         except Exception as e:
             logger.warning(f"Could not persist login cookies for {handle}: {e}")
 
@@ -131,11 +133,15 @@ class TwitterAuthService:
 
         return reason.strip() or "Login did not complete and X gave no reason."
 
-    async def resolve_screen_name(self, auth_token: str, ct0: str) -> Optional[str]:
-        """Return the X handle these cookies belong to, or None if they fail.
+    async def resolve_credentials(self, auth_token: str, ct0: str) -> Tuple[str, Optional[str]]:
+        """Classify a cookie pair and resolve its handle.
 
-        Doubles as add-time validation: invalid or expired cookies return None,
-        so /auth can reject them instead of storing a silently-dead account.
+        Returns (outcome, handle):
+          ("ok", handle)      - 200, cookies are good, handle resolved
+          ("invalid", None)   - 401, cookies are genuinely bad or expired
+          ("unverified", None)- 403 / 429 / network / non-JSON: the check could
+                                not run (datacenter-IP block or rate limit), so
+                                the cookies MIGHT be fine. Caller may add anyway.
         """
         auth_token, ct0 = auth_token.strip(), ct0.strip()
         headers = {
@@ -147,14 +153,23 @@ class TwitterAuthService:
         try:
             async with httpx.AsyncClient(timeout=self.PROBE_TIMEOUT_SECONDS) as client:
                 resp = await client.get(VERIFY_CREDENTIALS_URL, headers=headers)
-            if resp.status_code != 200:
-                logger.info("verify_credentials returned %s", resp.status_code)
-                return None
-            screen_name = resp.json().get("screen_name")
-            return screen_name.strip() if screen_name else None
         except Exception as e:
-            logger.warning(f"Could not resolve screen name: {e}")
-            return None
+            logger.warning(f"verify_credentials request failed: {e}")
+            return "unverified", None
+
+        if resp.status_code == 200:
+            try:
+                screen_name = resp.json().get("screen_name")
+            except Exception:
+                return "unverified", None
+            if screen_name:
+                return "ok", screen_name.strip()
+            return "unverified", None
+        if resp.status_code == 401:
+            return "invalid", None
+        # 403 (IP/Cloudflare block), 429 (rate limit), or anything else: unknown.
+        logger.info("verify_credentials returned %s; treating as unverified", resp.status_code)
+        return "unverified", None
 
     async def get_active_accounts_count(self) -> int:
         """Return the number of logged-in, usable accounts in the pool."""
